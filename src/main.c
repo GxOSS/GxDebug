@@ -9,6 +9,8 @@
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
 #include "esp_attr.h"
+#include "esp_system.h"
+#include "esp_random.h"
 #include "soc/gpio_reg.h"
 
 #define POST_BIT7_PIN    GPIO_NUM_32  // FT5R8
@@ -26,12 +28,7 @@
 #define KERNEL_UART_BUF_SIZE  1024
 #define KERNEL_UART_BAUD      115200
 
-// This part does not work yet please stay tuned
-#define SMC_UART_NUM          UART_NUM_1
-#define SMC_UART_ESP32_RX     GPIO_NUM_21  // D21 - ESP32 RX (from Xbox SMC TX)
-#define SMC_UART_ESP32_TX     GPIO_NUM_22  // D22 - ESP32 TX (to Xbox SMC RX)
-#define SMC_UART_BUF_SIZE     256
-#define SMC_UART_BAUD         115200
+
 
 #define MAX_CAPTURED_CODES 512
 
@@ -262,11 +259,27 @@ static void print_post_code(uint8_t code, int64_t timestamp) {
 
 static captured_code_t capture_buffer[MAX_CAPTURED_CODES];
 static volatile uint32_t capture_count = 0;
+static volatile int64_t last_capture_time_us = 0;
 
 // This is really handy when debugging but otherwise useless, either way i'm leaving it in
 static volatile bool post_codes_enabled = true;     // POST code GPIO capture
 static volatile bool kernel_uart_enabled = true;      // Kernel UART output
-static volatile bool smc_uart_enabled = true;         // SMC UART output
+
+static void print_uart_hex_dump(const char *tag, const uint8_t *data, size_t len) {
+    printf("[%s] ", tag);
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = data[i];
+        if (c >= 0x20 && c <= 0x7E) {
+            putchar((char)c);
+        } else {
+            printf("\\x%02X", c);
+        }
+    }
+    printf("\n");
+}
+
+
+
 
 // Turbo: on
 static inline uint8_t IRAM_ATTR read_post_bits(void) {
@@ -288,25 +301,32 @@ static inline uint8_t IRAM_ATTR read_post_bits(void) {
 static void IRAM_ATTR gpio_isr_handler(void *arg) {
     if (!post_codes_enabled) return;
 
-    // Ask me what this does and i'll say "i don't know"
+    //probably not the best way to do this but it works and is simple enough, if you have a better idea please let me know
     uint8_t r1 = read_post_bits();
     uint8_t r2 = read_post_bits();
     uint8_t r3 = read_post_bits();
-
-    uint8_t final = (r1 == r2) ? r1 : ((r2 == r3) ? r2 : r3);
+    uint8_t sampled = (r1 == r2) ? r1 : ((r2 == r3) ? r2 : r3);
 
     static uint8_t last_stable = 0xFF;
+    int64_t now_us = esp_timer_get_time();
 
-    // Only accept when post code changes (again due to my noisy code yep)
-    if (final != last_stable && final != 0x00) {
-        uint32_t current_count = capture_count;
-        if (current_count < MAX_CAPTURED_CODES) {
-            capture_buffer[current_count].code = final;
-            capture_buffer[current_count].timestamp = esp_timer_get_time();
-            capture_count = current_count + 1;
-        }
-        last_stable = final;
+    if (sampled == 0x00) {
+        return;
     }
+
+    if (sampled == last_stable) {
+        return;
+    }
+
+    uint32_t current_count = capture_count;
+    if (current_count < MAX_CAPTURED_CODES) {
+        capture_buffer[current_count].code = sampled;
+        capture_buffer[current_count].timestamp = now_us;
+        capture_count = current_count + 1;
+    }
+
+    last_stable = sampled;
+    last_capture_time_us = now_us;
 }
 
 // Kernel UART task
@@ -324,6 +344,7 @@ static void kernel_uart_task(void *pvParameters) {
         if (len > 0) {
             data[len] = '\0';
             if (!kernel_uart_enabled) {
+                print_uart_hex_dump("KERNEL", data, (size_t)len);
                 continue;
             }
 
@@ -349,47 +370,11 @@ static void kernel_uart_task(void *pvParameters) {
     }
 }
 
-// SMC UART task
-static void smc_uart_task(void *pvParameters) {
-    uint8_t data[SMC_UART_BUF_SIZE];
-    char line_buffer[256];
-    int line_pos = 0;
 
-    ESP_LOGI(TAG, "SMC UART task started on GPIO%d (RX) @ %d baud", SMC_UART_ESP32_RX, SMC_UART_BAUD);
-    printf("\n[SMC UART] Listening on GPIO%d @ %d baud (output %s)...\n\n",
-           SMC_UART_ESP32_RX, SMC_UART_BAUD, smc_uart_enabled ? "enabled" : "disabled");
 
-    while (1) {
-        int len = uart_read_bytes(SMC_UART_NUM, data, SMC_UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
-        if (len > 0) {
-            ESP_LOGI(TAG, "SMC UART received %d bytes", len);
-            data[len] = '\0';
-            if (!smc_uart_enabled) {
-                ESP_LOGI(TAG, "SMC UART data discarded (output disabled)");
-                continue;
-            }
 
-            for (int i = 0; i < len; i++) {
-                char c = (char)data[i];
-                if (c == '\n' || c == '\r') {
-                    if (line_pos > 0) {
-                        line_buffer[line_pos] = '\0';
-                        printf("[SMC] %s\n", line_buffer);
-                        line_pos = 0;
-                    }
-                } else if (line_pos < sizeof(line_buffer) - 1) {
-                    line_buffer[line_pos++] = c;
-                }
 
-                if (line_pos >= sizeof(line_buffer) - 2) {
-                    line_buffer[line_pos] = '\0';
-                    printf("[SMC] %s\n", line_buffer);
-                    line_pos = 0;
-                }
-            }
-        }
-    }
-}
+
 
 // kernel UART
 static void init_kernel_uart(void) {
@@ -408,22 +393,7 @@ static void init_kernel_uart(void) {
     ESP_ERROR_CHECK(gpio_set_pull_mode(KERNEL_UART_ESP32_RX, GPIO_PULLUP_ONLY));
 }
 
-// SMC UART
-static void init_smc_uart(void) {
-    uart_config_t uart_config = {
-        .baud_rate = SMC_UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
 
-    ESP_ERROR_CHECK(uart_driver_install(SMC_UART_NUM, SMC_UART_BUF_SIZE * 2, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(SMC_UART_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(SMC_UART_NUM, SMC_UART_ESP32_TX, SMC_UART_ESP32_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(gpio_set_pull_mode(SMC_UART_ESP32_RX, GPIO_PULLUP_ONLY));
-}
 
 void app_main(void) {
     // Configure all POST pins as inputs with interrupts (does what it says on the tin)
@@ -452,22 +422,20 @@ void app_main(void) {
     gpio_isr_handler_add(POST_BIT1_PIN, gpio_isr_handler, NULL);
     gpio_isr_handler_add(POST_BIT0_PIN, gpio_isr_handler, NULL);
 
+
+
     // UART
     init_kernel_uart();
-    init_smc_uart();
 
     // UART tasks
     xTaskCreate(kernel_uart_task, "kernel_uart", 4096, NULL, 5, NULL);
-    xTaskCreate(smc_uart_task, "smc_uart", 4096, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "Xbox 360 POST Code Reader v5 - GPIO + Kernel UART + SMC UART");
+    ESP_LOGI(TAG, "Xbox 360 POST Code Reader v5 - GPIO + Kernel UART");
     ESP_LOGI(TAG, "POST Pins: GPIO%d,%d,%d,%d,%d,%d,%d,%d",
              POST_BIT7_PIN, POST_BIT6_PIN, POST_BIT5_PIN, POST_BIT4_PIN,
              POST_BIT3_PIN, POST_BIT2_PIN, POST_BIT1_PIN, POST_BIT0_PIN);
     ESP_LOGI(TAG, "Kernel UART: GPIO%d (TX) / GPIO%d (RX) @ %d baud",
              KERNEL_UART_ESP32_TX, KERNEL_UART_ESP32_RX, KERNEL_UART_BAUD);
-    ESP_LOGI(TAG, "SMC UART: GPIO%d (TX) / GPIO%d (RX) @ %d baud",
-             SMC_UART_ESP32_TX, SMC_UART_ESP32_RX, SMC_UART_BAUD);
     printf("\nWaiting for POST codes and UART output...\n\n");
     
     // it worked before i added this
