@@ -428,13 +428,13 @@ void app_main(void) {
         return;
     }
 
-    ESP_LOGI(TAG, "Xbox 360 POST Code Reader v5 - GPIO + Kernel UART");
+    ESP_LOGI(TAG, "GxDebug Alpha");
     ESP_LOGI(TAG, "POST Pins: GPIO%d,%d,%d,%d,%d,%d,%d,%d",
              POST_BIT7_PIN, POST_BIT6_PIN, POST_BIT5_PIN, POST_BIT4_PIN,
              POST_BIT3_PIN, POST_BIT2_PIN, POST_BIT1_PIN, POST_BIT0_PIN);
-    ESP_LOGI(TAG, "Kernel UART: GPIO%d (RX only) @ %d baud",
-             KERNEL_UART_ESP32_RX, KERNEL_UART_BAUD);
-    printf("\nWaiting for POST codes and UART output...\n\n");
+    ESP_LOGI(TAG, "Kernel UART: GPIO%d (TX) / GPIO%d (RX) @ %d baud",
+             KERNEL_UART_ESP32_TX, KERNEL_UART_ESP32_RX, KERNEL_UART_BAUD);
+    printf("\nReady to receive...\n\n");
     
     // it worked before i added this
     int64_t base_time = 0;
