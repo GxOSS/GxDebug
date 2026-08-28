@@ -2,6 +2,7 @@
 #include <inttypes.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
@@ -10,7 +11,6 @@
 #include "esp_task_wdt.h"
 #include "esp_attr.h"
 #include "esp_system.h"
-#include "esp_random.h"
 #include "soc/gpio_reg.h"
 
 #define POST_BIT7_PIN    GPIO_NUM_32  // FT5R8
@@ -251,35 +251,18 @@ static void print_post_code(uint8_t code, int64_t timestamp) {
     const post_code_entry_t* entry = lookup_post_code(code);
     int64_t timestamp_ms = timestamp / 1000;
     if (entry) {
-        printf("%10lld ms | 0x%02X | %-10s | %s\n", timestamp_ms, code, entry->stage, entry->description);
+        printf("%10" PRIi64 " ms | 0x%02X | %-10s | %s\n", timestamp_ms, code, entry->stage, entry->description);
     } else {
-        printf("%10lld ms | 0x%02X | %-10s | %s\n", timestamp_ms, code, "???", "Unknown POST code");
+        printf("%10" PRIi64 " ms | 0x%02X | %-10s | %s\n", timestamp_ms, code, "???", "Unknown POST code");
     }
 }
 
-static captured_code_t capture_buffer[MAX_CAPTURED_CODES];
-static volatile uint32_t capture_count = 0;
-static volatile int64_t last_capture_time_us = 0;
+static QueueHandle_t capture_queue;
+static volatile bool capture_overflowed = false;
 
 // This is really handy when debugging but otherwise useless, either way i'm leaving it in
 static volatile bool post_codes_enabled = true;     // POST code GPIO capture
 static volatile bool kernel_uart_enabled = true;      // Kernel UART output
-
-static void print_uart_hex_dump(const char *tag, const uint8_t *data, size_t len) {
-    printf("[%s] ", tag);
-    for (size_t i = 0; i < len; i++) {
-        uint8_t c = data[i];
-        if (c >= 0x20 && c <= 0x7E) {
-            putchar((char)c);
-        } else {
-            printf("\\x%02X", c);
-        }
-    }
-    printf("\n");
-}
-
-
-
 
 // Turbo: on
 static inline uint8_t IRAM_ATTR read_post_bits(void) {
@@ -308,9 +291,9 @@ static void IRAM_ATTR gpio_isr_handler(void *arg) {
     uint8_t sampled = (r1 == r2) ? r1 : ((r2 == r3) ? r2 : r3);
 
     static uint8_t last_stable = 0xFF;
-    int64_t now_us = esp_timer_get_time();
-
     if (sampled == 0x00) {
+        // Let the same POST code be captured again after the bus returns idle.
+        last_stable = 0x00;
         return;
     }
 
@@ -318,15 +301,19 @@ static void IRAM_ATTR gpio_isr_handler(void *arg) {
         return;
     }
 
-    uint32_t current_count = capture_count;
-    if (current_count < MAX_CAPTURED_CODES) {
-        capture_buffer[current_count].code = sampled;
-        capture_buffer[current_count].timestamp = now_us;
-        capture_count = current_count + 1;
+    captured_code_t captured = {
+        .code = sampled,
+        .timestamp = esp_timer_get_time(),
+    };
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    if (xQueueSendFromISR(capture_queue, &captured, &higher_priority_task_woken) != pdTRUE) {
+        capture_overflowed = true;
     }
 
     last_stable = sampled;
-    last_capture_time_us = now_us;
+    if (higher_priority_task_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
 }
 
 // Kernel UART task
@@ -344,7 +331,6 @@ static void kernel_uart_task(void *pvParameters) {
         if (len > 0) {
             data[len] = '\0';
             if (!kernel_uart_enabled) {
-                print_uart_hex_dump("KERNEL", data, (size_t)len);
                 continue;
             }
 
@@ -356,11 +342,12 @@ static void kernel_uart_task(void *pvParameters) {
                         printf("[KERNEL] %s\n", line_buffer);
                         line_pos = 0;
                     }
-                } else if (line_pos < sizeof(line_buffer) - 1) {
-                    line_buffer[line_pos++] = c;
+                } else if (line_pos < (int)sizeof(line_buffer) - 1) {
+                    // Avoid embedded NUL/control bytes truncating or corrupting output.
+                    line_buffer[line_pos++] = (c == '\t' || (c >= 0x20 && c <= 0x7e)) ? c : '.';
                 }
 
-                if (line_pos >= sizeof(line_buffer) - 2) {
+                if (line_pos >= (int)sizeof(line_buffer) - 2) {
                     line_buffer[line_pos] = '\0';
                     printf("[KERNEL] %s\n", line_buffer);
                     line_pos = 0;
@@ -389,13 +376,21 @@ static void init_kernel_uart(void) {
 
     ESP_ERROR_CHECK(uart_driver_install(KERNEL_UART_NUM, KERNEL_UART_BUF_SIZE * 2, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(KERNEL_UART_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(KERNEL_UART_NUM, KERNEL_UART_ESP32_TX, KERNEL_UART_ESP32_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    // RX-only: driving the console's RX line can interfere with kernel output.
+    ESP_ERROR_CHECK(uart_set_pin(KERNEL_UART_NUM, UART_PIN_NO_CHANGE, KERNEL_UART_ESP32_RX,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(gpio_set_pull_mode(KERNEL_UART_ESP32_RX, GPIO_PULLUP_ONLY));
 }
 
 
 
 void app_main(void) {
+    capture_queue = xQueueCreate(MAX_CAPTURED_CODES, sizeof(captured_code_t));
+    if (capture_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate POST capture queue");
+        return;
+    }
+
     // Configure all POST pins as inputs with interrupts (does what it says on the tin)
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << POST_BIT7_PIN) | (1ULL << POST_BIT6_PIN) |
@@ -407,20 +402,20 @@ void app_main(void) {
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_ANYEDGE,
     };
-    gpio_config(&io_conf);
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
 
     // Install GPIO interrupt service (for per-pin interrupt handling)
-    gpio_install_isr_service(0);
+    ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_IRAM));
 
     // Add ISR handler to all POST pins (it wont work otherwise)
-    gpio_isr_handler_add(POST_BIT7_PIN, gpio_isr_handler, NULL);
-    gpio_isr_handler_add(POST_BIT6_PIN, gpio_isr_handler, NULL);
-    gpio_isr_handler_add(POST_BIT5_PIN, gpio_isr_handler, NULL);
-    gpio_isr_handler_add(POST_BIT4_PIN, gpio_isr_handler, NULL);
-    gpio_isr_handler_add(POST_BIT3_PIN, gpio_isr_handler, NULL);
-    gpio_isr_handler_add(POST_BIT2_PIN, gpio_isr_handler, NULL);
-    gpio_isr_handler_add(POST_BIT1_PIN, gpio_isr_handler, NULL);
-    gpio_isr_handler_add(POST_BIT0_PIN, gpio_isr_handler, NULL);
+    ESP_ERROR_CHECK(gpio_isr_handler_add(POST_BIT7_PIN, gpio_isr_handler, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(POST_BIT6_PIN, gpio_isr_handler, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(POST_BIT5_PIN, gpio_isr_handler, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(POST_BIT4_PIN, gpio_isr_handler, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(POST_BIT3_PIN, gpio_isr_handler, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(POST_BIT2_PIN, gpio_isr_handler, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(POST_BIT1_PIN, gpio_isr_handler, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(POST_BIT0_PIN, gpio_isr_handler, NULL));
 
 
 
@@ -428,18 +423,20 @@ void app_main(void) {
     init_kernel_uart();
 
     // UART tasks
-    xTaskCreate(kernel_uart_task, "kernel_uart", 4096, NULL, 5, NULL);
+    if (xTaskCreate(kernel_uart_task, "kernel_uart", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create kernel UART task");
+        return;
+    }
 
     ESP_LOGI(TAG, "Xbox 360 POST Code Reader v5 - GPIO + Kernel UART");
     ESP_LOGI(TAG, "POST Pins: GPIO%d,%d,%d,%d,%d,%d,%d,%d",
              POST_BIT7_PIN, POST_BIT6_PIN, POST_BIT5_PIN, POST_BIT4_PIN,
              POST_BIT3_PIN, POST_BIT2_PIN, POST_BIT1_PIN, POST_BIT0_PIN);
-    ESP_LOGI(TAG, "Kernel UART: GPIO%d (TX) / GPIO%d (RX) @ %d baud",
-             KERNEL_UART_ESP32_TX, KERNEL_UART_ESP32_RX, KERNEL_UART_BAUD);
+    ESP_LOGI(TAG, "Kernel UART: GPIO%d (RX only) @ %d baud",
+             KERNEL_UART_ESP32_RX, KERNEL_UART_BAUD);
     printf("\nWaiting for POST codes and UART output...\n\n");
     
     // it worked before i added this
-    uint32_t printed_idx = 0;
     int64_t base_time = 0;
     bool boot_started = false;
     uint32_t code_count = 0;
@@ -447,16 +444,13 @@ void app_main(void) {
     const int64_t BOOT_TIMEOUT_US = 5000000;  // 5 seconds inactivity = new boot
 
     while (1) {
-        uint32_t count = capture_count;
+        captured_code_t captured;
         int64_t current_time = esp_timer_get_time();
 
-        // Lazy check for new boot
-        if (boot_started && count > 0 && (current_time - last_code_time > BOOT_TIMEOUT_US)) {
+        if (boot_started && (current_time - last_code_time > BOOT_TIMEOUT_US)) {
             if (post_codes_enabled) {
                 printf("\n--- IDLE TIMEOUT/BOOT FINISHED ---\n\n");
             }
-            capture_count = 0;
-            printed_idx = 0;
             boot_started = false;
             code_count = 0;
             base_time = 0;
@@ -465,9 +459,9 @@ void app_main(void) {
             continue;
         }
 
-        while (printed_idx < count) {
-            uint8_t code = capture_buffer[printed_idx].code;
-            int64_t ts = capture_buffer[printed_idx].timestamp;
+        while (xQueueReceive(capture_queue, &captured, 0) == pdTRUE) {
+            uint8_t code = captured.code;
+            int64_t ts = captured.timestamp;
             last_code_time = ts;
 
             if (post_codes_enabled) {
@@ -480,7 +474,6 @@ void app_main(void) {
                         printf("#%-3" PRIu32 " ", code_count);
                         print_post_code(code, 0);
                     }
-                    printed_idx++;
                     continue;
                 }
 
@@ -488,12 +481,11 @@ void app_main(void) {
                 printf("#%-3" PRIu32 " ", code_count);
                 print_post_code(code, ts - base_time);
             }
-            printed_idx++;
         }
 
-        if (count >= MAX_CAPTURED_CODES) {
-            capture_count = 0;
-            printed_idx = 0;
+        if (capture_overflowed) {
+            ESP_LOGW(TAG, "POST capture queue overflowed; one or more codes were dropped");
+            capture_overflowed = false;
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
